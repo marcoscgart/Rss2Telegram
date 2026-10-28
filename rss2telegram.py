@@ -2,6 +2,7 @@ from bs4 import BeautifulSoup
 from html import escape
 from telebot import types
 import feedparser
+import json
 import os
 import random
 import re
@@ -180,8 +181,93 @@ def send_message(topic):
     return sent
 
 
-def fetch_feed(url, attempts=4):
-    """Baixa o feed com novas tentativas (o RSS do YouTube dá 404/500 intermitentes)."""
+def _walk(node):
+    """Percorre recursivamente o JSON da página do YouTube."""
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk(v)
+
+
+def _yt_page_items(url, limit=5):
+    """Extrai (video_id, título, é_short) da aba /videos ou /shorts de um canal."""
+    response = requests.get(url, headers={**HEADERS, 'Accept-Language': 'pt-BR'}, timeout=15)
+    match = re.search(r'var ytInitialData = (\{.*?\});</script>', response.text, re.S)
+    if not match:
+        return None, []
+    data = json.loads(match.group(1))
+    soup = BeautifulSoup(response.text, 'html.parser')
+    tag = soup.find('meta', {'property': 'og:title'})
+    channel = tag['content'] if tag else None
+
+    items, seen = [], set()
+    for node in _walk(data):
+        vid = title = None
+        short = False
+        if 'videoRenderer' in node:  # layout antigo
+            r = node['videoRenderer']
+            vid = r.get('videoId')
+            title = ''.join(x.get('text', '') for x in r.get('title', {}).get('runs', []))
+        elif 'lockupViewModel' in node:  # layout novo de /videos
+            r = node['lockupViewModel']
+            vid = r.get('contentId')
+            title = (r.get('metadata', {}).get('lockupMetadataViewModel', {})
+                      .get('title', {}).get('content'))
+        elif 'shortsLockupViewModel' in node:  # /shorts
+            r = node['shortsLockupViewModel']
+            vid = (r.get('onTap', {}).get('innertubeCommand', {})
+                    .get('reelWatchEndpoint', {}).get('videoId'))
+            title = r.get('overlayMetadata', {}).get('primaryText', {}).get('content')
+            short = True
+        if vid and title and vid not in seen:
+            seen.add(vid)
+            items.append((vid, title, short))
+            if len(items) >= limit:
+                break
+    return channel, items
+
+
+def youtube_page_feed(channel_id):
+    """Plano B quando o RSS do YouTube falha: lê as abas de vídeos e shorts do canal
+    e devolve no mesmo formato do feedparser (mais recentes primeiro)."""
+    base = f'https://www.youtube.com/channel/{channel_id}'
+    channel, entries = None, []
+    for tab in ('videos', 'shorts'):
+        try:
+            name, items = _yt_page_items(f'{base}/{tab}')
+        except (requests.exceptions.RequestException, ValueError) as e:
+            print(f'    erro lendo {base}/{tab}: {e}')
+            continue
+        channel = channel or name
+        for vid, title, short in items:
+            link = (f'https://www.youtube.com/shorts/{vid}' if short
+                    else f'https://www.youtube.com/watch?v={vid}')
+            entries.append({
+                'title': title,
+                'link': link,
+                'summary': '',
+                'media_thumbnail': [{'url': f'https://i.ytimg.com/vi/{vid}/hqdefault.jpg'}],
+            })
+    return {'feed': {'title': channel} if channel else {}, 'entries': entries}
+
+
+def fetch_feed(url, attempts=3):
+    """Baixa o feed com novas tentativas (o RSS do YouTube dá 404/500 intermitentes).
+    Se for um feed de canal do YouTube e o RSS não responder, lê a página do canal."""
+    feed = _fetch_rss(url, attempts)
+    if feed.get('feed', {}).get('title'):
+        return feed
+    yt = re.search(r'youtube\.com/feeds/videos\.xml\?channel_id=(UC[\w-]{22})', url)
+    if yt:
+        print('    RSS do YouTube indisponível; lendo a página do canal')
+        return youtube_page_feed(yt.group(1))
+    return feed
+
+
+def _fetch_rss(url, attempts):
     for i in range(attempts):
         try:
             response = requests.get(url, headers=HEADERS, timeout=15)
@@ -240,6 +326,7 @@ if __name__ == '__main__':
         raise SystemExit('Configure as variáveis URL e DESTINATION.')
     if not BOT_TOKEN and not DRYRUN:
         raise SystemExit('Configure o secret BOT_TOKEN.')
+    db().close()  # garante que o histórico exista para virar artifact
     for feed_url in URL.split():
         try:
             check_topics(feed_url)
