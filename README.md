@@ -82,3 +82,19 @@ Faça um *Fork*, defina as variáveis e habilite a ação em "*Enable workflow*"
 ![Enable Workflow](https://user-images.githubusercontent.com/7331540/178158090-bf774cae-071b-4ac2-ab03-9c5c1132b79e.png)
 
 A ação irá buscar as atualizações a cada hora conforme definido no arquivo [cron.yml](.github/workflows/cron.yml).
+
+## Central de Tudo — canais do YouTube
+
+Cole o conteúdo de [`feeds.list`](feeds.list) na variável `URL` (Settings → Secrets and variables → Actions → Variables):
+
+| Canal | channel_id |
+|---|---|
+| Canaltech | UC_bXJnsgwOqEPA_-6N6faKw |
+| BBC News Brasil | UCthbIFAxbXTTQEC7EcQvP1Q |
+| Atila Iamarino | UCSTlOTcyUmzvhQi6F8lFi5w |
+| NPR Music | UC4eYXhJI4-7wSWc8UNRwD4A |
+| Autodesk 3ds Max Learning Channel | UClS3gPxzFYgTUz6JOIruyqA |
+| Tiny Desk Brasil | UCFV9qv5deOsJ_AF7k_t4h3A |
+
+Outras variáveis: `DESTINATION` = `@centraldetudo`; secret `BOT_TOKEN` = token do @CentraldeTudo_bot.
+Para adicionar um canal: `https://www.youtube.com/feeds/videos.xml?channel_id=<ID>`.

@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: '0 */1 * * *'
 
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: rss2telegram
+  cancel-in-progress: false
 
 jobs:
   rss2telegram:
@@ -11,23 +18,31 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
-      - name: Download artifact
+        uses: actions/checkout@v4
+
+      # Baixa o histórico (rss2telegram.db) da última execução bem-sucedida.
+      # Se não existir (primeira execução), o passo falha e o script roda em
+      # modo DRYRUN: só registra os links, sem postar.
+      - name: Download history
         id: download
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v2
+        uses: dawidd6/action-download-artifact@v6
         with:
           workflow: cron.yml
           workflow_conclusion: success
-      - name: Move database
-        continue-on-error: true
-        run: mv rss2telegram/rss2telegram.db rss2telegram.db
+          name: rss2telegram
+          path: .
+          if_no_artifact_found: fail
+
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
+          python-version: '3.12'
+          cache: pip
+
       - name: Install Requirements
         run: pip install -r requirements.txt
+
       - name: Run Rss to Telegram
         run: python rss2telegram.py
         env:
@@ -39,8 +54,10 @@ jobs:
           BUTTON_TEXT: ${{ vars.BUTTON_TEXT }}
           PARAMETERS: ${{ vars.PARAMETERS }}
           DRYRUN: ${{ steps.download.outcome }}
+
       - name: Upload history
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: rss2telegram
           path: rss2telegram.db
+          retention-days: 90

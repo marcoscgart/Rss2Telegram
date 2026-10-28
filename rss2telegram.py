@@ -1,168 +1,247 @@
 from bs4 import BeautifulSoup
+from html import escape
 from telebot import types
-from time import gmtime
 import feedparser
 import os
+import random
 import re
+import sqlite3
 import telebot
 import time
-import random
 import requests
-import sqlite3
+
+DB_FILE = 'rss2telegram.db'
+HEADERS = {'User-agent': 'Mozilla/5.1'}
+SUMMARY_MAX = 300  # legenda de foto no Telegram aceita no máximo 1024 caracteres
+
 
 def get_variable(variable):
-    if not os.environ.get(f'{variable}'):
-        var_file = open(f'{variable}.txt', 'r')
-        return var_file.read()
-    return os.environ.get(f'{variable}')
+    """Lê a variável do ambiente ou, se não existir, do arquivo <variavel>.txt."""
+    value = os.environ.get(variable)
+    if value:
+        return value
+    try:
+        with open(f'{variable}.txt', 'r', encoding='utf-8') as var_file:
+            return var_file.read().strip()
+    except FileNotFoundError:
+        return None
+
 
 URL = get_variable('URL')
 DESTINATION = get_variable('DESTINATION')
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-EMOJIS = os.environ.get('EMOJIS', '🗞,📰,🗒,🗓,📋,🔗,📝,🗃')
-PARAMETERS = os.environ.get('PARAMETERS', False)
-DRYRUN = os.environ.get('DRYRUN')
+BOT_TOKEN = get_variable('BOT_TOKEN')
+EMOJIS = os.environ.get('EMOJIS') or '🗞,📰,🗒,🗓,📋,🔗,📝,🗃'
+PARAMETERS = os.environ.get('PARAMETERS') or False
+MESSAGE_TEMPLATE = os.environ.get('MESSAGE_TEMPLATE') or False
+BUTTON_TEXT = os.environ.get('BUTTON_TEXT') or False
+DRYRUN = os.environ.get('DRYRUN') == 'failure'
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN or '0:dryrun')
+
+
+# ---------- histórico ----------
+
+def db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('CREATE TABLE IF NOT EXISTS history (link TEXT)')
+    return conn
+
 
 def add_to_history(link):
-    conn = sqlite3.connect('rss2telegram.db')
-    cursor = conn.cursor()
-    aux = f'INSERT INTO history (link) VALUES ("{link}")'
-    cursor.execute(aux)
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.execute('INSERT INTO history (link) VALUES (?)', (link,))
+
 
 def check_history(link):
-    conn = sqlite3.connect('rss2telegram.db')
-    cursor = conn.cursor()
-    aux = f'SELECT * from history WHERE link="{link}"'
-    cursor.execute(aux)
-    data = cursor.fetchone()
-    conn.close()
-    return data
+    with db() as conn:
+        return conn.execute('SELECT 1 FROM history WHERE link = ?', (link,)).fetchone()
+
+
+# ---------- filtros (RULES.txt) ----------
 
 def firewall(text):
+    """Regras em RULES.txt, uma por linha: ACCEPT:palavra / DROP:palavra / DROP:ALL.
+    A última regra que casar decide. Sem regra que case, o post é aceito."""
     try:
-        rules = open(f'RULES.txt', 'r')
+        with open('RULES.txt', 'r', encoding='utf-8') as f:
+            lines = f.readlines()
     except FileNotFoundError:
         return True
-    result = None
-    for rule in rules.readlines():
-        opt, arg = rule.split(':')
-        arg = arg.strip()
-        if arg == 'ALL' and opt == 'DROP':
-            result = False
-        elif arg == 'ALL' and opt == 'ACCEPT':
-            result = True
-        elif arg.lower() in text.lower() and opt == 'DROP':
-            result = False
-        elif arg.lower() in text.lower() and opt == 'ACCEPT':
-            result = True
+    result = True
+    text = text.lower()
+    for rule in lines:
+        if ':' not in rule:
+            continue
+        opt, arg = rule.split(':', 1)
+        opt, arg = opt.strip().upper(), arg.strip()
+        if not arg:
+            continue
+        if arg == 'ALL' or arg.lower() in text:
+            if opt == 'DROP':
+                result = False
+            elif opt == 'ACCEPT':
+                result = True
     return result
 
-def send_message(topic, button):
-    if DRYRUN == 'failure':
-        return
-    MESSAGE_TEMPLATE = os.environ.get(f'MESSAGE_TEMPLATE', False)
-    if MESSAGE_TEMPLATE:
-        MESSAGE_TEMPLATE = set_text_vars(MESSAGE_TEMPLATE, topic)
-    else:
-        MESSAGE_TEMPLATE = f'<b>{topic["title"]}</b>'
 
-    if not firewall(str(topic)):
-        print(f'xxx {topic["title"]}')
-        return
+# ---------- montagem da mensagem ----------
 
-    btn_link = button
-    if button:
-        btn_link = types.InlineKeyboardMarkup()
-        btn = types.InlineKeyboardButton(f'{button}', url=topic['link'])
-        btn_link.row(btn)
+def define_link(link):
+    if PARAMETERS:
+        sep = '&' if '?' in link else '?'
+        return f'{link}{sep}{PARAMETERS}'
+    return link
 
-    if topic['photo']:
-        response = requests.get(topic['photo'], headers = {'User-agent': 'Mozilla/5.1'})
-        open('img', 'wb').write(response.content)
-        for dest in DESTINATION.split(','):
-            photo = open('img', 'rb')
-            try:
-                bot.send_photo(dest, photo, caption=MESSAGE_TEMPLATE, parse_mode='HTML', reply_markup=btn_link)
-            except telebot.apihelper.ApiTelegramException:
-                topic['photo'] = False
-                send_message(topic, button)
-    else:
-        for dest in DESTINATION.split(','):
-            bot.send_message(dest, MESSAGE_TEMPLATE, parse_mode='HTML', reply_markup=btn_link, disable_web_page_preview=True)
-    print(f'... {topic["title"]}')
-    time.sleep(0.2)
+
+def clean_summary(summary):
+    text = re.sub('<[^<]+?>', '', summary or '').strip()
+    if len(text) > SUMMARY_MAX:
+        text = text[:SUMMARY_MAX].rsplit(' ', 1)[0] + '…'
+    return text
+
+
+def set_text_vars(text, topic, html=True):
+    """Troca {TITLE}, {SUMMARY}, {LINK}, {SITE_NAME} e {EMOJI} pelos valores do post."""
+    values = {
+        'SITE_NAME': topic['site_name'],
+        'TITLE': topic['title'],
+        'SUMMARY': clean_summary(topic['summary']),
+        'LINK': define_link(topic['link']),
+        'EMOJI': random.choice(EMOJIS.split(',')),
+    }
+    if html:
+        values = {k: escape(v) for k, v in values.items()}
+
+    def repl(match):
+        return values.get(match.group(1), match.group(0))
+
+    text = re.sub(r'\{(\w+)\}', repl, text)
+    return text.replace('\\n', '\n')
+
+
+def build_button(topic):
+    if not BUTTON_TEXT:
+        return None
+    markup = types.InlineKeyboardMarkup()
+    label = set_text_vars(BUTTON_TEXT, topic, html=False)
+    markup.row(types.InlineKeyboardButton(label, url=define_link(topic['link'])))
+    return markup
+
 
 def get_img(url):
     try:
-        response = requests.get(url, headers = {'User-agent': 'Mozilla/5.1'}, timeout=3)
+        response = requests.get(url, headers=HEADERS, timeout=5)
         html = BeautifulSoup(response.content, 'html.parser')
-        photo = html.find('meta', {'property': 'og:image'})['content']
-    except TypeError:
-        photo = False
-    except requests.exceptions.ReadTimeout:
-        photo = False
-    except requests.exceptions.TooManyRedirects:
-        photo = False
-    return photo
-
-def define_link(link, PARAMETERS):
-    if PARAMETERS:
-        if '?' in link:
-            return f'{link}&{PARAMETERS}'
-        return f'{link}?{PARAMETERS}'
-    return f'{link}'
+        tag = html.find('meta', {'property': 'og:image'})
+        return tag['content'] if tag and tag.get('content') else False
+    except requests.exceptions.RequestException:
+        return False
 
 
+def download_photo(url):
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        return response.content
+    except requests.exceptions.RequestException:
+        return None
 
-def set_text_vars(text, topic):
-    cases = {
-        'SITE_NAME': topic['site_name'],
-        'TITLE': topic['title'],
-        'SUMMARY': re.sub('<[^<]+?>', '', topic['summary']),
-        'LINK': define_link(topic['link'], PARAMETERS),
-        'EMOJI': random.choice(EMOJIS.split(","))
-    }
-    for word in re.split('{|}', text):
-        try:
-            text = text.replace(word, cases.get(word))
-        except TypeError:
+
+# ---------- envio ----------
+
+def send_message(topic):
+    """Envia o post para todos os destinos. Retorna True se ao menos um recebeu."""
+    if MESSAGE_TEMPLATE:
+        message = set_text_vars(MESSAGE_TEMPLATE, topic)
+    else:
+        message = f'<b>{escape(topic["title"])}</b>'
+    markup = build_button(topic)
+    photo = download_photo(topic['photo']) if topic['photo'] else None
+
+    sent = False
+    for dest in DESTINATION.split(','):
+        dest = dest.strip()
+        if not dest:
             continue
-    return text.replace('\\n', '\n').replace('{', '').replace('}', '')
+        try:
+            if photo:
+                try:
+                    bot.send_photo(dest, photo, caption=message, parse_mode='HTML', reply_markup=markup)
+                    sent = True
+                    continue
+                except telebot.apihelper.ApiTelegramException as e:
+                    print(f'    foto recusada em {dest} ({e}); enviando como texto')
+            bot.send_message(dest, message, parse_mode='HTML', reply_markup=markup,
+                             disable_web_page_preview=True)
+            sent = True
+        except telebot.apihelper.ApiTelegramException as e:
+            print(f'!!! erro ao enviar para {dest}: {e}')
+        time.sleep(0.5)
+    return sent
+
+
+def fetch_feed(url, attempts=4):
+    """Baixa o feed com novas tentativas (o RSS do YouTube dá 404/500 intermitentes)."""
+    for i in range(attempts):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=15)
+            if response.ok:
+                return feedparser.parse(response.content)
+            print(f'    {url} respondeu {response.status_code} (tentativa {i + 1})')
+        except requests.exceptions.RequestException as e:
+            print(f'    erro em {url}: {e} (tentativa {i + 1})')
+        time.sleep(3 * (i + 1))
+    return feedparser.parse(b'')
 
 
 def check_topics(url):
-    now = gmtime()
-    feed = feedparser.parse(url)
-    try:
-        source = feed['feed']['title']
-    except KeyError:
+    feed = fetch_feed(url)
+    source = feed.get('feed', {}).get('title')
+    if not source:
         print(f'\nERRO: {url} não parece um feed RSS válido.')
         return
-    print(f'\nChecando {source}:{url}')
-    for tpc in reversed(feed['items'][:10]):
-        if check_history(tpc.links[0].href):
+    print(f'\nChecando {source}: {url}')
+
+    for tpc in reversed(feed.get('entries', [])[:10]):
+        link = tpc.get('link') or (tpc.links[0].href if tpc.get('links') else None)
+        if not link or check_history(link):
             continue
-        add_to_history(tpc.links[0].href)
-        topic = {}
-        topic['site_name'] = feed['feed']['title']
-        topic['title'] = tpc.title.strip()
-        topic['summary'] = tpc.summary
-        topic['link'] = tpc.links[0].href
-        topic['photo'] = get_img(tpc.links[0].href)
-        BUTTON_TEXT = os.environ.get('BUTTON_TEXT', False)
-        if BUTTON_TEXT:
-            BUTTON_TEXT = set_text_vars(BUTTON_TEXT, topic)
+
+        topic = {
+            'site_name': source,
+            'title': (tpc.get('title') or '').strip(),
+            'summary': tpc.get('summary', ''),
+            'link': link,
+            'photo': False,
+        }
+
+        if DRYRUN:
+            add_to_history(link)
+            print(f'--- (dry run) {topic["title"]}')
+            continue
+
+        if not firewall(f'{topic["title"]} {topic["summary"]}'):
+            add_to_history(link)
+            print(f'xxx {topic["title"]}')
+            continue
+
+        # YouTube e muitos feeds já trazem a miniatura; senão busca a og:image da página
+        thumbs = tpc.get('media_thumbnail')
+        topic['photo'] = thumbs[0].get('url') if thumbs else get_img(link)
+
+        # Só marca como enviado se deu certo, para tentar de novo na próxima execução
+        if send_message(topic):
+            add_to_history(link)
+            print(f'... {topic["title"]}')
+
+
+if __name__ == '__main__':
+    if not URL or not DESTINATION:
+        raise SystemExit('Configure as variáveis URL e DESTINATION.')
+    if not BOT_TOKEN and not DRYRUN:
+        raise SystemExit('Configure o secret BOT_TOKEN.')
+    for feed_url in URL.split():
         try:
-            send_message(topic, BUTTON_TEXT)
-        except telebot.apihelper.ApiTelegramException as e:
-            print(e)
-            pass
-
-if __name__ == "__main__":
-    for url in URL.split():
-        check_topics(url)
-
+            check_topics(feed_url)
+        except Exception as e:  # um feed com problema não derruba os outros
+            print(f'\nERRO ao processar {feed_url}: {e}')
