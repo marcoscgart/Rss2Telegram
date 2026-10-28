@@ -42,15 +42,44 @@ bot = telebot.TeleBot(BOT_TOKEN or '0:dryrun')
 
 # ---------- histórico ----------
 
+HISTORY_DAYS = int(os.environ.get('HISTORY_DAYS') or 90)
+
+
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute('CREATE TABLE IF NOT EXISTS history (link TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS feeds (url TEXT PRIMARY KEY)')
+    cols = [c[1] for c in conn.execute('PRAGMA table_info(history)')]
+    if 'added_at' not in cols:  # bancos antigos: os itens existentes ganham a data de hoje
+        conn.execute('ALTER TABLE history ADD COLUMN added_at INTEGER')
+        conn.execute('UPDATE history SET added_at = ?', (int(time.time()),))
     return conn
 
 
 def add_to_history(link):
     with db() as conn:
-        conn.execute('INSERT INTO history (link) VALUES (?)', (link,))
+        conn.execute('INSERT INTO history (link, added_at) VALUES (?, ?)', (link, int(time.time())))
+
+
+def prune_history():
+    """Apaga do histórico os links com mais de HISTORY_DAYS dias. Os feeds só mostram
+    os itens recentes, então links antigos não voltam a aparecer."""
+    limit = int(time.time()) - HISTORY_DAYS * 86400
+    with db() as conn:
+        removed = conn.execute('DELETE FROM history WHERE added_at < ?', (limit,)).rowcount
+    conn.close()
+    if removed:
+        print(f'Histórico: {removed} links com mais de {HISTORY_DAYS} dias removidos')
+
+
+def is_known_feed(url):
+    with db() as conn:
+        return conn.execute('SELECT 1 FROM feeds WHERE url = ?', (url,)).fetchone()
+
+
+def mark_feed_known(url):
+    with db() as conn:
+        conn.execute('INSERT OR IGNORE INTO feeds (url) VALUES (?)', (url,))
 
 
 def check_history(link):
@@ -288,8 +317,18 @@ def check_topics(url):
         return
     print(f'\nChecando {source}: {url}')
 
-    for tpc in reversed(feed.get('entries', [])[:10]):
-        link = tpc.get('link') or (tpc.links[0].href if tpc.get('links') else None)
+    def entry_link(tpc):
+        return tpc.get('link') or (tpc.links[0].href if tpc.get('links') else None)
+
+    entries = feed.get('entries', [])[:10]
+    # Feed recém-adicionado: só registra, sem postar, para não despejar
+    # as últimas notícias no canal de uma vez.
+    first_time = not is_known_feed(url)
+    if first_time and entries:
+        print('    feed novo: registrando itens atuais sem postar')
+
+    for tpc in reversed(entries):
+        link = entry_link(tpc)
         if not link or check_history(link):
             continue
 
@@ -301,7 +340,7 @@ def check_topics(url):
             'photo': False,
         }
 
-        if DRYRUN:
+        if DRYRUN or first_time:
             add_to_history(link)
             print(f'--- (dry run) {topic["title"]}')
             continue
@@ -320,6 +359,9 @@ def check_topics(url):
             add_to_history(link)
             print(f'... {topic["title"]}')
 
+    if entries:
+        mark_feed_known(url)
+
 
 if __name__ == '__main__':
     if not URL or not DESTINATION:
@@ -327,6 +369,7 @@ if __name__ == '__main__':
     if not BOT_TOKEN and not DRYRUN:
         raise SystemExit('Configure o secret BOT_TOKEN.')
     db().close()  # garante que o histórico exista para virar artifact
+    prune_history()
     for feed_url in URL.split():
         try:
             check_topics(feed_url)
